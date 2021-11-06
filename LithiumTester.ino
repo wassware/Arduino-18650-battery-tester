@@ -2,609 +2,767 @@
 // for use with charger module with 4056 chip
 // mods needed:
 //   cut enable pin - 8
-//   solder lead to both pins 6 (inverse of charge complete) and 8 as the control line
-// the control line read is
-//   high = charging  - this keps enable high
-//   low = charged - this takes enable low
-// seting arduino pin to output briefly and setting new state low or high has
-// enough umph to flip flop the charge state
+//   solder lead to both pin 8 as the control line
 // the module also has a DW01A protection chip and MOSFETS to do additional over/under volts and
 // overdischarge current. internal wiring for clarity:
 // +in -> chargecontrol -> +out/+batt   (+out and +batt tied)
 // -in/-out -> protectionMOSFETs -> -batt  (-in and -out tied)
 // for discharge +batt -> R -> MOSFET -> -out
-// so the volts measure on the battery will include a tiny effect from the protectionMOSFETs
+// so the volts measure on the battery will include a tiny effect from the protection MOSFETs
 // however this prevents accidental over discharge..
 //
 // the 4056 controls the charge up to 4.2 volts
 // arduino directly measures the cell voltage
 // discharge is via an output to gate IRF520N mosfet and a series resistor
-// discharge current is implied from voltage
+// discharge current is implied from voltage and resistor
 
 // arduino connections
-// digital pins run from 2 in pairs control state, discharge:
+// digital pins run from 2 in pairs charge enable, discharge:
 // analogue pin from 0
 
-// all volts im mv
+// all volts stored in mv as integer
+//
+// as a state engine see state enumeration
+// for commmands see processserial()
+//
 
-const String stateNotOff = "!! state <> off";
-//const String voltsUnderLimit = "!!volts under limit";
+// use a watchdog. used to perform reset
+#include "Watchdog.h"
+Watchdog watchdog;
 
-const byte numCells = 6;            // cells in rig
-const byte anaSamples = 10;         // 10 slot cycle buffer - 10 samples per slot
-const byte samplesPerSec = 10;        // samples read per second added to each buffer slot.
-const byte anaDivider = anaSamples * samplesPerSec; 
-const double resistorDefault = 4.0;
-const double defaultVoltConvert =  4.11 / 1006 * 1000.0;
-const int dischargeRawAdjust = 60 / defaultVoltConvert;
-
-int chargeTestVolts = 5000;       // test mode - lower test charge
-int chargeRestTime = 60;          // after charging - seconds before discharge
-int dischargeTestVolts = 3700;  // pause on discharge to test how volts recover.
-int dischargeTestTime = 60;       // .. for how long - same at end discharge
-int dischargeEndVolts = 3000;         // discharge stop volts
-int storeVolts = 3800;          // storage charge default
-int chargeTestTime = 60;        // during store charge - rest time before volt check in recharge-to loop
-bool showAnaRaw = false; 
-
+/// strings.. limited ram so ned to manage
+const String stateNotOff = "!!state<>off";
+const String voltsUnderLimit = "!!volts";
 const char c = ',';
 
-// state
-const byte stDisable = 0;        // initially disabled until check controls work
-const byte stOff = 1;            // off
-const byte stCharge = 2;         // charging= start charge - checks voltage
-const byte stChargePause = 3;    // holds after charging to check volts drop
-const byte stDischarge1 = 4;     // discharge stage 1
-const byte stDischPause1 = 5;  // discharge pause = check volt rise
-const byte stDischarge2 = 6;     // discharge stage 1
-const byte stDischPause2 = 7;   // pause before recharge - check volt lift
-const byte stStoreCharge = 8; // recover to standby volts charging
-const byte stStoreChargePause = 9;   // recover to standby volts resting
+// configuration..
+const byte numCells = 6;                            // cells in rig
+const byte anaSamples = 5;                          // N slot ring buffer for adding raw analog readings each 1 sec loop
+const byte samplesPerSec = 5;                       // samples read per second added to each ring buffer slot.
+const byte anaDivider = anaSamples * samplesPerSec; // for dividing sum of ring buffer by for average raw value
+const double voltConvert =  4.11 / 981.0 * 1000.0;  // from sample reading = volts / raw analogue * 1000 to give mv
+const int dischargeRawAdjust = 60 / voltConvert;    // from sample. under discharge volt drop over protection mosfet - not used...
+const double resistor[6] = {4.0, 4.1, 4.1, 4.1, 4.1, 4.1}; // resistors = one 8+8 rest 8+8.2
+
+const int chargeMaxInterval = 180;            // max interval including pause time
+const int chargeMinInterval = 60;             // min interval including pause time
+const int chargePauseTime = anaSamples + 5;   // pause time in charge to check volt drop
+const int maxChargeDelta = 300;               // max allowable charge delta value - indicates 
+const int dischargeMidVolts = 3700;           // delta volts captured at mid discharge
+const int dischargeInterval = 180;            // discharge interval including pause time
+const int dischargePauseTime = anaSamples + 5;// .. then pause charge for this time - check volts drop
+const int dischargeEndVolts = 3000;           // discharge stop volts
+const int storeVoltsDefault = 3800;           // storage charge level
+const int buildVoltsDefault = 3500;           // alternative store level bring to charge state for building packs
+const int minStartVolts = 3000;               // min volts to start charge or discharge
+const int statePauseTime = 180;               // time between switching states
+
+// state enumeration
+const byte stDisable = 0;                 // can disable to supress logging
+const byte stOff = 1;                     // off
+const byte stCharge = 2;                  // charging phase with charge end tests
+const byte stDischarge = 3;               // discharge
+const byte stStoreCharge = 4;             // recover to standby volts charging
+const byte stStoreDischarge = 5;          // recover to standby volts discharging
 
 // data per cell..
 struct Cell
 {
   public:
-   
-    byte ix;                      // index + analog pin
+    byte ix;                              // index + analog pin
     int chargePin()
     {
-      return 2 + ix + ix;               // charge io pin
-    }
+      return 2 + ix + ix;                 // charge io pin
+    };
     int dischargePin()
     {
-      return 3 + ix + ix;            // discharge out pin
-    }
-    double voltConvert =  defaultVoltConvert;
+      return 3 + ix + ix;                 // discharge out pin
+    };
     unsigned int voltArr[anaSamples];     // one per second - each samples/sec sum
-    int volts;                // averaged volts
-    double resistor = resistorDefault;             // 
-    byte state;
-    byte prevState;
-    double mah;
+    unsigned int lastAnalogRaw;           // last value read
+    int volts;                            // averaged volts
+    double resistor;                      // discharge resistor value
+    byte state;                           // current state
+    bool charge;                          // is charging
+    bool discharge;                       // is discharging
+    bool paused;                          // flags whan paused - used by logging
+    double mah;                           // discharge mAH
     unsigned int waitTill;                // wait timer - seconds.
-    bool logCell;                 // log flag for cell
-    int chargeFinishVolts;     // volts at charge end signal
-    int chargeFinishDeltaVolts;     // volt drop after resting after charge
-    int dischargePauseVolts;   // volts samples at test pause1 start
-    int discharge1DeltaVolts;   // ... and difference after pause time
-    int discharge2DeltaVolts;   // end discharge - volt recovery
-    int storeChargeFinishVolts;    // target to charge to to hit storeVolts 
-    int lastMinuteVolts;
-    int millivoltsPerMin;
-    unsigned int elapsed;                  // elapsed seconds for current operation
-    bool doCharge;
-    bool doDischarge;
-    bool doStoreCharge;
-    void off()
+    int storeLongPause;                   // on final store pause extend to 60 sec
+    int pauseVolts;                       // volts at start of pause
+    int prevPauseVolts;                   // previous volts at start of pause
+    int chargeDeltaVolts;                 // volt drop after pausing charge
+    int dischargeDeltaVolts;              // ... and difference after pause time
+    int dischargeMidDeltaVolts;           // end discharge - volt recovery
+    int storeChargeFinishVolts;           // target to charge to to hit storeVolts
+    unsigned int elapsed;                 // elapsed seconds for current operation
+    bool doCharge;                        // charge pending
+    bool doDischarge;                     // discharge pending
+    bool doStoreCharge;                   // store charge pending
+    void off()                            // switch to off
     {
       state = stOff;
       doCharge = false;
       doDischarge = false;
       doStoreCharge = false;
-    };
+      digitalWrite(dischargePin(), false);
+      digitalWrite(chargePin(), false);
+    }
 };
 
-Cell cells[numCells];
+// variables..
+Cell cells[numCells];                     // the cells
+// currently selected cell
+unsigned long nextSecond;                 // timing - millis() at next second
+unsigned long nextVoltsRead;              // timing - millis() at next analogue read
+unsigned int ts;                          // time counter in seconds - for all wait timing
+int voltArrIx = 0;                        // analog ring buffer voltArr index
+unsigned int secCounter;                  // second counter for counting minutes
+int storeVolts =  storeVoltsDefault;      // set by command - can be set to buildVoltsDefault
 
-Cell *selCell;
+bool forceLog = false;                    // to force a log on commmand
 
-int logInterval = 60;
-unsigned int nextLogAt = 0;
-int voltArrIx = 0;               // volt cycle buffer pointer
-unsigned long nextSecond = 1000;
-unsigned long nextVoltsRead = 0;
-unsigned int secCounter = 0;               // for counting minutes
-
-
-
-
+// state string values for log
 String stateS(byte iS)
 {
   switch (iS)
   {
     case stOff:      return "off";
-    case stCharge:   return "chg ";
-    case stChargePause: return "chgp";
-    case stDischarge1: return "disch1";
-    case stDischPause1: return "dischp1";
-    case stDischarge2: return "disch2";
-    case stDischPause2: return "dischp2";
-    case stStoreCharge: return "store";
-    case stStoreChargePause: return "storep";
+    case stCharge:   return "chg";
+    case stDischarge: return "dis";
+    case stStoreCharge: return "sto";
+    case stStoreDischarge: return "std";
   }
-  return "disabl";
+  return "xxx";
 }
 
-unsigned int ts = 0;           // time seconds counter
-
+// write to log
 void log(String s)
 {
   Serial.println(s);
 }
+
+// log prefix with cell id s= status change
 void logCell(Cell *cell, String s)
 {
-  if (cell->ix == selCell->ix)
-  {
-    log("c*" + String(cell->ix) + c + s);
-  }
-  else
-  {
-    log("c:" + String(cell->ix) + c + s);
-  }
+  log("s,c:" + String(cell->ix + 1) + c + s);
 }
-
-// true = charge, false = no charge
-// involves flipping from input to output
-void setChargeState(Cell *cell, bool newState)
+// log prefix with cell id l= log
+void logCell2(Cell *cell, String s)
 {
-  if (cell->state < 0)
-  {
-    return;
-  }
-  pinMode(cell->chargePin(), INPUT_PULLUP);   // set as input - should e already..
-  bool nowState = digitalRead(cell->chargePin());
-  if (nowState == newState)
-  {
-    return;
-  }
-  pinMode(cell->chargePin(), OUTPUT);
-  digitalWrite(cell->chargePin(), newState);
-  pinMode(cell->chargePin(), INPUT_PULLUP);   // set back as input
-  nowState = digitalRead(cell->chargePin());
-  if (nowState == newState)
-  {
-    return;
-  }
-  logCell(cell, "!! set state pin: " + String(cell->chargePin()));
-  cell->state = stDisable;     // disable this cell.
+  log("l,c:" + String(cell->ix + 1) + c + s);
 }
 
+// convert to x.xxx
+String stringK(int val)
+{
+  return String(val / 1000.0, 3);
+}
+// v=x.xxx   for reporting volts
+String stringKV(int val)
+{
+  return " v=" + stringK(val);
+}
+// d=xxx     for reporting millivolt delta
+String stringDmv(int val)
+{
+  return " d=" + String(val);
+}
 
 void setup()
 {
   Serial.begin(9600);           //  setup serial
   analogReference(EXTERNAL);
+  const char compile_date[] = "lithiumtester "__DATE__ " " __TIME__;
+  log(compile_date);
   log("start setup..");
-  log("check cell control..");
   for (int ic = 0; ic < numCells; ic++)
   {
     Cell *cell;
     cell = &cells[ic];
     cell->ix = ic;
-    // check control charge state - might disable
-    cell->state = stOff;
-    setChargeState(cell, false);
-    delay(200);
-    setChargeState(cell, true);
-    delay(200);
-    setChargeState(cell, false);
-    delay(100);
-    // configure discharge pin
+    
+    // configure output pins
     pinMode(cell->dischargePin(), OUTPUT);
-    digitalWrite(cell->dischargePin(), false);
-    cell->resistor = resistorDefault;
+    pinMode(cell->chargePin(), OUTPUT);
+
+    cell->off();
+    // and resistors
+    cell->resistor = resistor[ic];
     for (int ix = 0; ix < anaSamples; ix++)
     {
       cell->voltArr[ix] = 0;
     }
-    unsigned long tMillis = millis();
-    nextVoltsRead = tMillis + 1000/samplesPerSec/2;
-    nextSecond = tMillis + 1000;
-    secCounter = 0;
-    ts = 0;
   }
-  selCell = &cells[0];
- 
-  log("OK");
+  // flash leds on chargers for visual
+  for (int ic = 0; ic < numCells; ic++)
+  {
+    Cell *cell;
+    cell = &cells[ic];
+    digitalWrite(cell->chargePin(), true);
+    delay(200);
+  }
+  for (int ic = 0; ic < numCells; ic++)
+  {
+    Cell *cell;
+    cell = &cells[ic];
+    digitalWrite(cell->chargePin(), false);
+    delay(200);
+  }
+  // start timers
+  unsigned long tMillis = millis();
+  nextVoltsRead = tMillis + 1000 / samplesPerSec / 2;
+  nextSecond = tMillis + 1000;
+  secCounter = 0;
+  ts = 0;
+
+  //watchdog
+  watchdog.enable(Watchdog::TIMEOUT_2S);
+
+  log("setup done");
 }
 
+// writes last analog raw alues to log - for calibration
+void logAnalogRaw()
+{
+  String s;
+  for (int ic = 0; ic < numCells; ic++)
+  {
+    Cell *cell;
+    cell = &cells[ic];
+    s += String(cell->lastAnalogRaw) + " ";
+  }
+  log(s);
+}
 
+// process each cell on 1 sec timer
 void doCell(Cell *cell)
 {
-  long voltSum = 0;
+  // total up raw readings
+  double voltSum = 0;
   for (int ix = 0; ix < anaSamples; ix++)
   {
     voltSum += cell->voltArr[ix];
-    //log(String(ix) + "=" + String(cell->voltArr[ix]));
-    
   }
+  // calculate volts
+  cell->volts = voltSum * voltConvert / anaDivider;
 
-  if (showAnaRaw)
-  {
-    cell->volts = voltSum / anaDivider;
-  }
-  else
-  {
-    cell->volts = voltSum / anaDivider * cell->voltConvert;
-  }
-  
-  bool charged = !digitalRead(cell->chargePin()) || cell->volts > chargeTestVolts;
-  
+  cell->charge = false;
+  cell->discharge = false;
+  cell->paused = false;
+
   switch (cell->state)
   {
+    // in stOff check pending states to change to
     case stOff:
       {
-        if (cell->doCharge)
+        if (ts < cell->waitTill)
+        {
+          // enforced wait for state change
+        }
+        else if (cell->doCharge)
         {
           cell->doCharge = false;
-          if (cell->volts < 3000)
+          if (cell->volts < minStartVolts)
           {
-            logCell(cell,"!!volts");
+            logCell(cell, voltsUnderLimit);
             cell->off();
           }
           else
           {
             cell->state = stCharge;
+            cell->chargeDeltaVolts = 0;
+            cell->pauseVolts = 0;
             cell->elapsed = 0;
-            logCell(cell,"charge v=" + String(cell->volts));
+            cell->waitTill = ts + chargeMaxInterval;
+            logCell(cell, stateS(cell->state) + stringKV(cell->volts));
           }
         }
         else if (cell->doDischarge)
         {
           cell->doDischarge = false;
-          if (cell->volts < 3000)
+          if (cell->volts < minStartVolts)
           {
-            logCell(cell,"!!volts");
+            logCell(cell, voltsUnderLimit);
             cell->off();
           }
           else
           {
+            cell->state = stDischarge;
             cell->elapsed = 0;
             cell->mah = 0;
-            if (cell->volts > dischargeTestVolts)
-            {
-              cell->state = stDischarge1;
-              logCell(cell,"disch1 v=" + String(cell->volts));
-            }
-            else
-            {
-              cell->state = stDischarge2;
-              logCell(cell,"disch2 v=" + String(cell->volts));
-            }
+            cell->pauseVolts = 0;
+            cell->dischargeMidDeltaVolts = 0;
+            cell->waitTill = ts + dischargeInterval;
+            logCell(cell, stateS(cell->state) + stringKV(cell->volts));
           }
         }
         else if (cell->doStoreCharge)
         {
-          if (cell->volts < 3000)
+          cell->doStoreCharge = false;
+          if (cell->volts < minStartVolts)
           {
-            cell->doStoreCharge = false;
-            logCell(cell,"!!volts");
+            logCell(cell, voltsUnderLimit);
             cell->off();
           }
           else
           {
             cell->elapsed = 0;
-            cell->storeChargeFinishVolts = storeVolts;      // start with +50mv as safe bet
+            cell->storeChargeFinishVolts = storeVolts;
+            cell->storeLongPause = 180;         // extra seconds on final store pause
             cell->waitTill = 0;
-            cell->state = stStoreCharge;
-            logCell(cell,"store v=" + String(cell->volts) + ", t= " + String(cell->storeChargeFinishVolts));
+            if (cell->volts > storeVolts)
+            {
+              cell->state = stStoreDischarge;
+            }
+            else
+            {
+              cell->state = stStoreCharge;
+            }
+            logCell(cell, stateS(cell->state) + stringKV(cell->volts) + " to" + stringKV(cell->storeChargeFinishVolts));
           }
         }
       }
       break;
-      
+
     case stCharge:
       {
-        // track time and current volts till charge flagged
-        if (!charged)
+        if (ts < cell->waitTill - chargePauseTime)
         {
-          cell->chargeFinishVolts = cell->volts;    // must capture while still charging
+          // charging
           cell->elapsed++;
+          cell->charge = true;
+          cell-> pauseVolts = 0;
         }
-        else
+        else if (ts >= cell->waitTill)
         {
-          cell->state = stChargePause;
-          cell->waitTill = ts + chargeRestTime;  // wait before discharge for volt check
-          logCell(cell,"charge pause v=" + String(cell->volts));
-        }
-      }
-      break;
-    
-    case stChargePause:
-      {
-        // wait for rest time - test volt drop - then discharge 
-        if (ts >= cell->waitTill)
-        {
-          cell->state = stOff;
-          cell->chargeFinishDeltaVolts = cell->chargeFinishVolts - cell->volts;
-          logCell(cell,"charge end v=" + String(cell->volts));
-        }
-      }
-      break;
-      
-    case stDischarge1:
-      {
-        cell->mah += cell->volts / cell->resistor / 3600;
-        cell->elapsed++;
-        
-        if (cell->volts <= dischargeTestVolts)
-        {
-          cell->dischargePauseVolts = cell->volts;
-          cell->state = stDischPause1;
-          cell->waitTill = ts + dischargeTestTime;  // wait then volt check
-          logCell(cell,"disch1 pause v=" + String(cell->volts));
-        }
-      }
-      break;
-    
-    case stDischPause1:
-      {
-        if (ts >= cell->waitTill)
-        {
-          cell->state = stDischarge2;
-          cell->discharge1DeltaVolts = cell->volts - cell->dischargePauseVolts;
-          logCell(cell,"disch2 v=" + String(cell->volts));
-        }
-      }
-      break;
-    
-    case stDischarge2:
-      {
-        cell->mah += cell->volts / cell->resistor / 3600;
-        cell->elapsed++;
-        if (cell->volts <= dischargeEndVolts)
-        {
-          cell->dischargePauseVolts = cell->volts;
-          cell->state = stDischPause2;
-          cell->waitTill = ts + dischargeTestTime;  // wait after discharge for volt check
-          logCell(cell,"disch2 pause v=" + String(cell->volts));
-        }
-      }
-      break;
-    
-    case stDischPause2:
-      {
-        if (ts >= cell->waitTill)
-        {
-          cell->state = stOff;
-          cell->elapsed = 0;
-          cell->discharge2DeltaVolts = cell->volts - cell->dischargePauseVolts;
-          logCell(cell,"disch2 end v=" + String(cell->volts));
-        }
-      }
-      break;
-    
-    case stStoreCharge:
-      {
-        cell->elapsed++;
-        if (cell->volts >= cell->storeChargeFinishVolts && ts >= cell->waitTill || cell->volts >= 4000) 
-        {
-          cell->storeChargeFinishVolts = cell->volts;
-          cell->state = stStoreChargePause;
-          cell->waitTill = ts + chargeTestTime;
-          logCell(cell,"store pause v=" + String(cell->volts));
-        }
-      }
-      break;
-    
-    case stStoreChargePause:
-      {
-        if (ts >= cell->waitTill)
-        {
-          if(cell->volts > storeVolts)
+          // end of charge pause
+          if (cell->volts >= cell->pauseVolts - 1)
           {
-            cell->waitTill = ts + chargeTestTime;
+            // volts has not dropped by > 1mv - assume charge done
+            cell->state = stOff;
+            logCell(cell, "charged: " + stringKV(cell->volts) + " d=" + String(cell->chargeDeltaVolts));
+            cell->waitTill = ts + statePauseTime;
           }
           else
           {
-            cell->state = stStoreCharge;
-            cell->waitTill = ts + 30;   // give time for volts to stabilize
-            cell->storeChargeFinishVolts = min(4000, storeVolts + (cell->storeChargeFinishVolts - cell->volts)+10);
-            logCell(cell,"storecont v=" + String(cell->volts) + ", t=" + String(cell->storeChargeFinishVolts));
+            // volts dropped by > 1mv - still charging
+            int deltaVolts = cell->pauseVolts - cell->volts; // capture last delta volts for log
+            // quality check - should see eithe pause volts increase of delta volts decrease
+            int voltChange = cell->pauseVolts - cell->prevPauseVolts;
+            int deltaChange = deltaVolts - cell->chargeDeltaVolts;
+            cell->chargeDeltaVolts = deltaVolts;
+            if (voltChange <=0 && deltaChange >=0)
+            {
+              cell->off();
+              logCell(cell,"!!VC=" + String(voltChange) + c + "DC=" + String(deltaChange)); 
+            }
+            else if (cell->chargeDeltaVolts > maxChargeDelta)
+            {
+              cell->off();
+              logCell(cell,"!!CD=" + String(cell->chargeDeltaVolts)); 
+            }
+            else
+            {
+              // charge again - for shorter time as end charge nears - double the delta volts is about right
+              // as the minimum of this ends at about 30-40
+              cell->waitTill = ts + max(chargeMinInterval, min(chargeMaxInterval, cell->chargeDeltaVolts * 2));
+              cell->charge = true;
+            }
           }
+        }
+        else
+        {
+          // paused
+          if (cell-> pauseVolts == 0)
+          {
+            cell->prevPauseVolts = cell->pauseVolts;
+            cell->pauseVolts = cell->volts;
+          }
+          cell->paused = true;
+        }
+      }
+      break;
+
+    case stDischarge:
+      {
+        // discharge to end volts pausing at intervals to capture delta volts
+        if (ts < cell->waitTill - dischargePauseTime)
+        {
+          // discharging
+          cell->pauseVolts = 0;
+          cell->mah += cell->volts / cell->resistor / 3600.0;
+          if (cell->volts <= dischargeEndVolts)
+          {
+            // is discharged
+            cell->state = stOff;
+            logCell(cell, "discharged: " + stringKV(cell->volts));
+            cell->waitTill = ts + statePauseTime;
+          }
+          else
+          {
+            // leave discharging
+            cell->discharge = true; 
+            cell->elapsed++;
+          }
+        }
+        else if (ts >= cell->waitTill)
+        {
+          // end pause
+          cell->dischargeDeltaVolts = cell->volts - cell->pauseVolts;
+          cell->waitTill = ts + dischargeInterval;
+          if (cell->dischargeMidDeltaVolts == 0 && cell->volts <= dischargeMidVolts)
+          {
+            cell->dischargeMidDeltaVolts = cell->dischargeDeltaVolts;  // capture mid discharge value
+          }
+          cell->discharge = true;
+        }
+        else
+        {
+          // paused
+          cell->paused = true;
+          if (cell->pauseVolts == 0)
+          {
+            cell->pauseVolts = cell->volts;
+          }
+        }
+      }
+      break;
+
+    case stStoreCharge:
+      {
+        // charge to target voltage. at pause interval check volt drop and adjust target voltage
+        if (ts < cell->waitTill - chargePauseTime)
+        {
+          // charging time
+          cell->pauseVolts = 0;
+          cell->charge = true;
+          cell->elapsed++;
+          if (cell->volts >= cell->storeChargeFinishVolts)
+          {
+            // hit finished volts - bring forward to pause time for next pass
+            cell->waitTill = ts + chargePauseTime;
+            //logCell(cell, "advanced to pause "+ String(cell->volts) + " " + String(cell->storeChargeFinishVolts));
+          }
+        }
+        else if (ts >= cell->waitTill)
+        {
+          //end pause - hit store volts?
+          if (cell->volts > storeVolts) 
+          {
+            if (cell->storeLongPause > 0)
+            {
+              cell->waitTill++;                         // use up extra time in pause - 
+              cell->storeLongPause--;
+              cell->paused = true;
+              //logCell(cell, "extend..");
+            }
+            else
+            {
+              cell->state = stOff;
+              logCell(cell, "restored: " + stringKV(cell->volts));
+              cell->waitTill = ts + statePauseTime;
+            }
+          }
+          else
+          {
+            cell->storeChargeFinishVolts = storeVolts + cell->pauseVolts - cell->volts + 10;
+            cell->waitTill = ts + chargeMaxInterval;
+            cell->charge = true;
+           // logCell(cell, "resume charge " + String(cell->storeChargeFinishVolts));
+          }
+        }
+        else
+        {
+          // in pause
+          if (cell->pauseVolts == 0)
+          {
+            cell->pauseVolts = cell->volts;     // capture start pause volts
+            //logCell(cell, "start pause " + String(cell->pauseVolts));
+          }
+          cell->paused = true;
+        }
+      }
+      break;
+
+     case stStoreDischarge:
+      {
+        // opposite of store charge - but brings volts down to store level
+        // discharge to target voltage. at pause interval check volt drop and adjust target voltage
+        if (ts < cell->waitTill - dischargePauseTime)
+        {
+          // discharging time
+          cell->pauseVolts = 0;
+          cell->discharge = true;
+          cell->elapsed++;
+          if (cell->volts <= cell->storeChargeFinishVolts)
+          {
+            // hit finished volts - bring forward to pause time for next pass
+            cell->waitTill = ts + dischargePauseTime;
+            //logCell(cell, "advanced to pause "+ String(cell->volts) + " " + String(cell->storeChargeFinishVolts));
+          }
+        }
+        else if (ts >= cell->waitTill)
+        {
+          //end pause - hit store volts?
+          if (cell->volts < storeVolts) 
+          {
+            if (cell->storeLongPause > 0)
+            {
+              cell->waitTill++;                         // use up extra time in pause - 
+              cell->storeLongPause--;
+              cell->paused = true;
+              //logCell(cell, "extend..");
+            }
+            else
+            {
+              cell->state = stOff;
+              logCell(cell, "restored: " + stringKV(cell->volts));
+              cell->waitTill = ts + statePauseTime;
+            }
+          }
+          else
+          {
+            cell->storeChargeFinishVolts = storeVolts + cell->pauseVolts - cell->volts - 10;
+            cell->waitTill = ts + dischargeInterval;
+            cell->discharge = true;
+           // logCell(cell, "resume discharge " + String(cell->storeChargeFinishVolts));
+          }
+        }
+        else
+        {
+          // in pause
+          if (cell->pauseVolts == 0)
+          {
+            cell->pauseVolts = cell->volts;     // capture start pause volts
+            //logCell(cell, "start pause " + String(cell->pauseVolts));
+          }
+          cell->paused = true;
         }
       }
       break;
   }
 
-  bool enable = false;
-  bool discharge = false;
-
-  switch (cell->state)
-  {
-    case stCharge:
-    case stStoreCharge:
-      enable = true;
-      break;
-    case stDischarge1:
-    case stDischarge2:
-      discharge = true;
-      break;
-  }
-  setChargeState(cell, enable);
-  digitalWrite(cell->dischargePin(), discharge);
+  // set charge and discharge outputs
+  digitalWrite(cell->dischargePin(), cell->discharge);
+  digitalWrite(cell->chargePin(), cell->charge);
 }
-bool forceLog = false;
-
 
 void processSerial()
 {
-  Cell *cell = selCell;
-  char k = Serial.read();
-  if (k >= char('0') && k <= char('9'))
+  // commands are single character processed in order - see below under ? command
+  // for example b1f2f3f4f5f6f will set to build volts and start full cycle on all cells
+  int cellIx = -1;
+
+  while (Serial.available() > 0)
   {
-    int newIx = k - char('0');
-    if (newIx >= 0 && newIx < numCells)
+    bool done = false;
+    char k = Serial.read();
+    if (k >= char('0') && k <= char('9'))
     {
-      selCell = &cells[newIx];
-      cell = selCell;
-      logCell(cell, "sel");
+      cellIx = k - char('0');
+      if (cellIx < 1 || cellIx > numCells)
+      {
+        log("!!invalid cell=" + String(k));
+        return;
+      }
+      done = true;
     }
-    else
+    if (!done)
     {
-      log("invalid cell");
+      switch (k)
+      {
+        case '\r':
+          done = true;
+          break;
+        case '\n':
+          done = true;
+          break;
+
+        case '?':
+          log("<n> sel 0-" + String(numCells));    // N select cell to operate on 1-6
+          log("log");                              // l forces a log output now
+          log("full cycle");                       // Nf schedules charge, discharge, store charge
+          log("chg");                              // Nc - charge only
+          log("disch");                            // Nd - discharge only
+          log("store");                            // Ns - does a charge to store volts or build volts
+          log("xit");                              // Nx - exit - sets cell back to off
+          log("z-disabl");                         // Nz - disables that cell so does not log
+          log("ana raw");                          // a - shows analog raw values
+          log("*-reset");                          // * - causes restet after 2 seconds
+          log("build");                            // b switches build volts between 3500 and 3800
+          log("rv=" + String(storeVolts));
+          done = true;
+          break;
+
+        case '*':
+          // cause watchdog timeout..
+          log("reset..");
+          delay(3000);
+          done = true;
+          break;
+
+        case 'l':
+          forceLog = true;
+          done = true;
+          break;
+
+        case 'a':
+          logAnalogRaw();
+          done = true;
+          break;
+
+        case 'b':
+          if (storeVolts == buildVoltsDefault)
+          {
+            storeVolts = storeVoltsDefault;
+          }
+          else
+          {
+            storeVolts = buildVoltsDefault;
+          }
+          log("rv=" + String(storeVolts));
+          done = true;
+          break;
+      }
+    }
+    // following need a selected cell...
+    if (!done)
+    {
+      if (cellIx == -1)
+      {
+        log("!!no cell selected");
+        return;
+      }
+      Cell *cell;
+      cell = &cells[cellIx - 1];
+      switch (k)
+      {
+        case 'z':
+          if (cell->state == stDisable)
+          {
+            cell->state = stOff;
+          }
+          else if (cell->state == stOff)
+          {
+            cell->state = stDisable;
+          }
+          break;
+
+
+        case 'f':
+          if (cell->state == stOff)
+          {
+            cell->waitTill = ts;
+            cell->doCharge = true;
+            cell->doDischarge = true;
+            cell->doStoreCharge = true;
+          }
+          else
+          {
+            logCell(cell, stateNotOff);
+          }
+          break;
+
+        case 'c':
+          if (cell->state == stOff)
+          {
+            cell->waitTill = ts;
+            cell->doCharge = true;
+          }
+          else
+          {
+            logCell(cell, stateNotOff);
+          }
+          break;
+
+        case 'd':
+          if (cell->state == stOff)
+          {
+            cell->waitTill = ts;
+            cell->doDischarge = true;
+          }
+          else
+          {
+            logCell(cell, stateNotOff);
+          }
+          break;
+
+
+        case 's':
+          if (cell->state == stOff)
+          {
+            cell->waitTill = ts;
+            cell->doStoreCharge = true;
+          }
+          else
+          {
+            logCell(cell, stateNotOff);
+          }
+          break;
+
+        case 'x':
+          cell->off();
+          logCell(cell, "off");
+          break;
+
+        default:
+          log("!! '" + String(k) + "' ??");
+          return;
+      }
     }
   }
-  else switch (k)
-    {
-      case '?':
-        //log("each character is a command..");
-        log("<n> sel 0-" + String(numCells));
-        log("l log");
-        log("f full cycle");
-        log("c chg");
-        log("d disch");
-        log("s store");
-        log("x stop");
-        log("t test");
-        log("r raw");
-        log("z disabl");
-
-      
-      case 't':
-         chargeTestVolts = 3900;       // test mode - lower test charge
-         chargeRestTime = 30;          // after charging - seconds before discharge
-         dischargeTestVolts = 3700;  // pause on discharge to test how volts recover.
-         dischargeTestTime = 30;       // .. for how long - same at end discharge
-         dischargeEndVolts = 3500;         // discharge stop volts
-         storeVolts = 3700;          // storage charge default
-         chargeTestTime = 30;        // during store charge - rest time before volt check in recharge-to loop
-         log("!!test");
-         break;
-
-       case 'r':
-        showAnaRaw = !showAnaRaw;
-        break;
-
-       case 'z':
-         if (selCell->state == stDisable)
-         {
-          selCell->state = stOff;
-         }
-         else if (selCell->state == stOff)
-         {
-            selCell->state = stDisable;
-         }
-         break;
-     
-      case 'l':
-        forceLog = true;
-        break;
-
-      case 'f':
-        if (cell->state == stOff)
-        {
-          cell->doCharge = true;
-          cell->doDischarge = true;
-          cell->doStoreCharge = true;
-        }
-        else
-        {
-          logCell(cell, stateNotOff); 
-        }
-      case 'c':
-        if (cell->state == stOff)
-        {
-          cell->doCharge = true;
-        }
-        else
-        {
-          logCell(cell, stateNotOff); 
-        }
-        break;
-      case 'd':
-        if (cell->state == stOff)
-        {
-          cell->doDischarge = true;
-        }
-        else
-        {
-          logCell(cell,stateNotOff); 
-        }
-        break;
-      case 's':
-        if (cell->state == stOff)
-        {
-          cell->doStoreCharge = true;
-        }
-        else
-        {
-          logCell(cell,stateNotOff); 
-        }
-        break;
-      case 'x':
-        cell->off();
-        logCell(cell, "off");
-        break;
-    }
 }
 
 void loop()
 {
-   // process serial.
-  while (Serial.available() > 0)
+  // process serial.
+  if (Serial.available() > 0)
   {
-    processSerial(); 
+    delay(100);        // wait all characters in
+    processSerial();
+    while (Serial.available() > 0)    // spill any remaining in case error
+    {
+      Serial.read();
+    }
   }
-  
+
+  // timers
   unsigned long tmillis = millis();
- 
+
   // read analogues at samplesPerSec
   while (tmillis >= nextVoltsRead)
   {
     for (int ic = 0; ic < numCells; ic++)
     {
       Cell *cell = &cells[ic];
-      cell->voltArr[voltArrIx] += analogRead(cell->ix);
-      if (cell->state == stDischarge1 || cell->state == stDischarge1)
-      {
-         cell->voltArr[voltArrIx] += dischargeRawAdjust;
-      }
+      cell->lastAnalogRaw = analogRead(cell->ix);
+      cell->voltArr[voltArrIx] += cell->lastAnalogRaw;
     }
-    nextVoltsRead += 1000/samplesPerSec;
+    nextVoltsRead += 1000 / samplesPerSec;
   }
 
   if (tmillis >= nextSecond)
   {
+    bool loggit = false;
+    watchdog.reset();
     ts = ts + 1;
-    nextVoltsRead = nextSecond + 1000/samplesPerSec/2;
-    nextSecond+= 1000;
+    nextVoltsRead = nextSecond + 10;
+    nextSecond += 1000;
     secCounter++;
-   
     if (secCounter >= 60)
     {
       secCounter = 0;
+      loggit = true;
     }
     
+    // process each cell
     for (int ic = 0; ic < numCells; ic++)
     {
-      Cell *cell = &cells[ic];
-      if (cell->state >= stOff)
-      {
-        doCell(cell);
-      }
-      if (secCounter == 0)
-      {
-        if (cell->lastMinuteVolts == 0)
-        {
-          cell->lastMinuteVolts = cell->volts;
-        }
-        cell->millivoltsPerMin = cell->volts - cell->lastMinuteVolts;
-        cell->lastMinuteVolts = cell->volts;
-      }
+      doCell(&cells[ic]);
     }
-    
+
+    // index and clear analog ring buffer
     voltArrIx++;
     if (voltArrIx >= anaSamples)
     {
@@ -614,31 +772,26 @@ void loop()
     {
       cells[ic].voltArr[voltArrIx] = 0;
     }
-  
-    bool loggit = false;
-    if (ts >= nextLogAt)
-    {
-      loggit = true;
-      nextLogAt += logInterval;
-    }
-    //forceLog = true;
+
     for (int ic = 0; ic < numCells; ic++)
     {
       Cell *cell = &cells[ic];
-      if ((cell->state > stOff && loggit) || (cell->state >= stOff && forceLog) || (cell->state != cell->prevState) || cell->logCell)
+      if ((cell->state >= stOff && loggit) || (cell->state >= stOff && forceLog) ) 
       {
-        logCell(cell, String(cell->elapsed/60.0, 1) + c + stateS(cell->state) 
-                + c + String(cell->volts) 
-                + c + String(cell->millivoltsPerMin)
-                + c + String(cell->mah, 0) 
-                + c + String(cell->chargeFinishVolts) 
-                + c + String(cell->chargeFinishDeltaVolts) 
-                + c + String(cell->discharge1DeltaVolts) 
-                + c + String(cell->discharge2DeltaVolts));
+        int showVolts = cell->volts;
+        if (cell->paused)
+        {
+          showVolts = cell->pauseVolts;
+        }
+        logCell2(cell, String(ts / 60)
+                 + c + String(cell->elapsed / 60) + c + stateS(cell->state)
+                 + c + stringK(showVolts)
+                 + c + stringK(cell->mah)
+                 + c + String(cell->chargeDeltaVolts)
+                 + c + String(cell->dischargeDeltaVolts)
+                 + c + String(cell->dischargeMidDeltaVolts)
+                   );
       }
-      cell->prevState = cell->state;
-      cell->logCell = false;
-      
     }
     forceLog = false;
   }
