@@ -1,0 +1,25 @@
+Lithium tester functional design. Read up on lithium cells on Battery University or similar to get an understanding of 3.7v lithium cell behaviour and protection needs.
+
+The tester needs to do 3 basic actions for each cell:
+- charge to full
+- discharge and measure capacity
+- restore to a set voltage
+
+The cell voltage measured is averaged over a rolling 5 seconds from 25 readings. As noted the protection MOSFETs add a 55mv error in the readings depending on charge / discharge current.
+
+The charge to full is handled by the charger module. During charge there is a charge pause (10s) at intervals (180s) to measure the cell voltage drop (chargedelta) during the pause. The voltage is recorded and the chargedelta used to indicate cell quality. For a good cell this is around 120mv below 4.16V dropping to around 35mv at the last point of charge before the charger switches itself off. At switchoff level there is no detected chargedelta and this signals end of charge. Above 300mv chargedelta the cell is flagged as suspect. Also if the pause to pause voltage does not increase OR the chargedelta does not decrease charging is flagged as suspect and stops.
+
+The discharge is via the 4 ohm resistor and MOSFET. There is a pause (10s) at intervals (180s) to measure the voltage rise (dischargedelta) over the pause. Dischargedelta gives an indication of the current the cell can handle. For a good cell this is around 120mv. Cutoff voltage is 3V under load as this is the practical real world minimum. The delta at 3.7 volts is recorded as a representative value. The capacity value is accumulated during discharge.
+
+The (re)store charge can be set to 2 levels: 3.8 volts for storage or 3.5v for building cell packs. The store will either charge or discharge the cell as necessary. A pause technique as used for charge and discharge as above and the delta is used to set the target charge/ discharge voltage to end up with the desired cell voltage.
+
+The cycle time of the code is 1 second. Every minute a log record for each cell is output. This can be saved and loaded to a spreadsheet and filters used to analyse any cell via a scatter graph. The interface can be the Arduino IDE serial monitor. I use Putty which can log to file as well. Set Putty to local line echo and local line editing. Also I add on an ESP32 programmed to present bluetooth serial so I can use a mobile to monitor remotely.
+
+Test time depends on cell quality and capacity. The charge is nominally at 1A so can be 60-180 minutes to get to 4.16V and then 30-90 minutes for topping off. Discharge is 60-180 minutes. Store charge is more predictable at 20-90 minutes.
+
+Each cell can be cycled individually.
+
+There are checks of minimum cell voltage of 3V to permit charge or discharge to take place.
+
+
+
