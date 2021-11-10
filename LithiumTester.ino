@@ -20,7 +20,7 @@
 // digital pins run from 2 in pairs charge enable, discharge:
 // analogue pin from 0
 
-// all volts stored in mv as integer
+// all volts stored in mv as integer - timers in seconds
 //
 // as a state engine see state enumeration
 // for commmands see processserial()
@@ -39,31 +39,31 @@ const char c = ',';
 const byte numCells = 6;                            // cells in rig
 const byte anaSamples = 5;                          // N slot ring buffer for adding raw analog readings each 1 sec loop
 const byte samplesPerSec = 5;                       // samples read per second added to each ring buffer slot.
-const byte anaDivider = anaSamples * samplesPerSec; // for dividing sum of ring buffer by for average raw value
-const double voltConvert =  4.11 / 981.0 * 1000.0;  // from sample reading = volts / raw analogue * 1000 to give mv
-const int dischargeRawAdjust = 60 / voltConvert;    // from sample. under discharge volt drop over protection mosfet - not used...
-const double resistor[6] = {4.0, 4.1, 4.1, 4.1, 4.1, 4.1}; // resistors = one 8+8 rest 8+8.2
+const float anaDivider = anaSamples * samplesPerSec; // for dividing sum of ring buffer by for average raw value
+const float voltConvert =  4.11 / 981.0 * 1000.0 / anaDivider;  // from sample reading = volts / raw analogue * 1000 to give mv
+const int dischargeVoltAdjust = 92;                 // V diff measured between cell and analog input points at 3.7v pause 
+const float resistor[6] = {4.004, 4.147, 4.147, 4.113, 4.114, 4.124}; // resistors = one 8+8 rest 8+8.2 - from volt/current measurement at 3.7V
 
 const int chargeMaxInterval = 180;            // max interval including pause time
 const int chargeMinInterval = 60;             // min interval including pause time
 const int chargePauseTime = anaSamples + 5;   // pause time in charge to check volt drop
-const int maxChargeDelta = 300;               // max allowable charge delta value - indicates 
-const int dischargeMidVolts = 3700;           // delta volts captured at mid discharge
+const int maxChargeDelta = 300;               // max allowable charge delta value - indicates suspect charge/cell/connection
+const int dischargeMidVolts = 3700;           // paused delta volts captured at mid discharge
 const int dischargeInterval = 180;            // discharge interval including pause time
 const int dischargePauseTime = anaSamples + 5;// .. then pause charge for this time - check volts drop
-const int dischargeEndVolts = 3000;           // discharge stop volts
+const int dischargeEndVolts = 3000 - dischargeVoltAdjust*3000.0/dischargeMidVolts;   // discharge stop volts - adjusted
 const int storeVoltsDefault = 3800;           // storage charge level
 const int buildVoltsDefault = 3500;           // alternative store level bring to charge state for building packs
 const int minStartVolts = 3000;               // min volts to start charge or discharge
-const int statePauseTime = 180;               // time between switching states
+const int statePauseTime = 180;               // delay time between switching states
 
 // state enumeration
 const byte stDisable = 0;                 // can disable to supress logging
 const byte stOff = 1;                     // off
 const byte stCharge = 2;                  // charging phase with charge end tests
 const byte stDischarge = 3;               // discharge
-const byte stStoreCharge = 4;             // recover to standby volts charging
-const byte stStoreDischarge = 5;          // recover to standby volts discharging
+const byte stStoreCharge = 4;             // recover to store volts charging
+const byte stStoreDischarge = 5;          // recover to store volts discharging
 
 // data per cell..
 struct Cell
@@ -78,15 +78,15 @@ struct Cell
     {
       return 3 + ix + ix;                 // discharge out pin
     };
-    unsigned int voltArr[anaSamples];     // one per second - each samples/sec sum
+    unsigned int anaReadings[anaSamples]; // one per second - each samples/sec summed each second
     unsigned int lastAnalogRaw;           // last value read
     int volts;                            // averaged volts
-    double resistor;                      // discharge resistor value
+    float resistor;                       // discharge resistor value
     byte state;                           // current state
     bool charge;                          // is charging
     bool discharge;                       // is discharging
     bool paused;                          // flags whan paused - used by logging
-    double mah;                           // discharge mAH
+    float mah;                            // discharge mAH
     unsigned int waitTill;                // wait timer - seconds.
     int storeLongPause;                   // on final store pause extend to 60 sec
     int pauseVolts;                       // volts at start of pause
@@ -116,7 +116,7 @@ Cell cells[numCells];                     // the cells
 unsigned long nextSecond;                 // timing - millis() at next second
 unsigned long nextVoltsRead;              // timing - millis() at next analogue read
 unsigned int ts;                          // time counter in seconds - for all wait timing
-int voltArrIx = 0;                        // analog ring buffer voltArr index
+int anaArrIx = 0;                         // analog ring buffer voltArr index
 unsigned int secCounter;                  // second counter for counting minutes
 int storeVolts =  storeVoltsDefault;      // set by command - can be set to buildVoltsDefault
 
@@ -191,7 +191,7 @@ void setup()
     cell->resistor = resistor[ic];
     for (int ix = 0; ix < anaSamples; ix++)
     {
-      cell->voltArr[ix] = 0;
+      cell->anaReadings[ix] = 0;
     }
   }
   // flash leds on chargers for visual
@@ -239,13 +239,13 @@ void logAnalogRaw()
 void doCell(Cell *cell)
 {
   // total up raw readings
-  double voltSum = 0;
+  long voltSum = 0;
   for (int ix = 0; ix < anaSamples; ix++)
   {
-    voltSum += cell->voltArr[ix];
+    voltSum += cell->anaReadings[ix];
   }
   // calculate volts
-  cell->volts = voltSum * voltConvert / anaDivider;
+  cell->volts = int(float(voltSum) * voltConvert);
 
   cell->charge = false;
   cell->discharge = false;
@@ -340,8 +340,8 @@ void doCell(Cell *cell)
           if (cell->volts >= cell->pauseVolts - 1)
           {
             // volts has not dropped by > 1mv - assume charge done
+            logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts) + " d=" + String(cell->chargeDeltaVolts));
             cell->state = stOff;
-            logCell(cell, "charged: " + stringKV(cell->volts) + " d=" + String(cell->chargeDeltaVolts));
             cell->waitTill = ts + statePauseTime;
           }
           else
@@ -391,12 +391,12 @@ void doCell(Cell *cell)
         {
           // discharging
           cell->pauseVolts = 0;
-          cell->mah += cell->volts / cell->resistor / 3600.0;
+          cell->mah += float(cell->volts) / cell->resistor / 3600.0;
           if (cell->volts <= dischargeEndVolts)
           {
             // is discharged
+            logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts));
             cell->state = stOff;
-            logCell(cell, "discharged: " + stringKV(cell->volts));
             cell->waitTill = ts + statePauseTime;
           }
           else
@@ -408,7 +408,8 @@ void doCell(Cell *cell)
         }
         else if (ts >= cell->waitTill)
         {
-          // end pause
+          // end pause - difference between on discharge at start pause and off discharge at end pause
+          //logCell(cell,String(cell->volts));
           cell->dischargeDeltaVolts = cell->volts - cell->pauseVolts;
           cell->waitTill = ts + dischargeInterval;
           if (cell->dischargeMidDeltaVolts == 0 && cell->volts <= dischargeMidVolts)
@@ -423,7 +424,9 @@ void doCell(Cell *cell)
           cell->paused = true;
           if (cell->pauseVolts == 0)
           {
-            cell->pauseVolts = cell->volts;
+            int adjust = int(float(dischargeVoltAdjust) * float(cell->volts) / float(dischargeMidVolts));  
+            cell->pauseVolts = cell->volts + adjust;
+            //logCell(cell,String(cell->volts) +c + String(adjust) + c + String(cell->pauseVolts));
           }
         }
       }
@@ -459,8 +462,8 @@ void doCell(Cell *cell)
             }
             else
             {
+              logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts));
               cell->state = stOff;
-              logCell(cell, "restored: " + stringKV(cell->volts));
               cell->waitTill = ts + statePauseTime;
             }
           }
@@ -516,8 +519,8 @@ void doCell(Cell *cell)
             }
             else
             {
+              logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts));
               cell->state = stOff;
-              logCell(cell, "restored: " + stringKV(cell->volts));
               cell->waitTill = ts + statePauseTime;
             }
           }
@@ -649,7 +652,6 @@ void processSerial()
           }
           break;
 
-
         case 'f':
           if (cell->state == stOff)
           {
@@ -687,7 +689,6 @@ void processSerial()
             logCell(cell, stateNotOff);
           }
           break;
-
 
         case 's':
           if (cell->state == stOff)
@@ -731,13 +732,13 @@ void loop()
   unsigned long tmillis = millis();
 
   // read analogues at samplesPerSec
-  while (tmillis >= nextVoltsRead)
+  while (tmillis >= nextVoltsRead && tmillis < nextSecond)
   {
     for (int ic = 0; ic < numCells; ic++)
     {
       Cell *cell = &cells[ic];
       cell->lastAnalogRaw = analogRead(cell->ix);
-      cell->voltArr[voltArrIx] += cell->lastAnalogRaw;
+      cell->anaReadings[anaArrIx] += cell->lastAnalogRaw;
     }
     nextVoltsRead += 1000 / samplesPerSec;
   }
@@ -762,15 +763,15 @@ void loop()
       doCell(&cells[ic]);
     }
 
-    // index and clear analog ring buffer
-    voltArrIx++;
-    if (voltArrIx >= anaSamples)
+    // step index on ring buffer
+    anaArrIx++;
+    if (anaArrIx >= anaSamples)
     {
-      voltArrIx = 0;
+      anaArrIx = 0;
     }
     for (int ic = 0; ic < numCells; ic++)
     {
-      cells[ic].voltArr[voltArrIx] = 0;
+      cells[ic].anaReadings[anaArrIx] = 0;
     }
 
     for (int ic = 0; ic < numCells; ic++)
