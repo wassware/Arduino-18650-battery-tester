@@ -127,11 +127,16 @@ String stateS(byte iS)
 {
   switch (iS)
   {
-    case stOff:      return "off";
-    case stCharge:   return "chg";
-    case stDischarge: return "dis";
-    case stStoreCharge: return "sto";
-    case stStoreDischarge: return "std";
+    case stOff:      
+      return "off";
+    case stCharge:   
+      return "chg";
+    case stDischarge: 
+      return "dis";
+    case stStoreCharge: 
+      return "sto";
+    case stStoreDischarge: 
+      return "std";
   }
   return "xxx";
 }
@@ -784,8 +789,15 @@ void loop()
         {
           showVolts = cell->pauseVolts;
         }
+        String state = stateS(cell->state);
+        if (cell->state == stOff && (cell->doCharge || cell->doDischarge || cell->doStoreCharge))
+        {
+          state = "pnd";  //have pending operations 
+        }
+        
         logCell2(cell, String(ts / 60)
-                 + c + String(cell->elapsed / 60) + c + stateS(cell->state)
+                 + c + String(cell->elapsed / 60) 
+                 + c + state
                  + c + stringK(showVolts)
                  + c + stringK(cell->mah)
                  + c + String(cell->chargeDeltaVolts)
