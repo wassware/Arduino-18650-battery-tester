@@ -64,6 +64,7 @@ const byte stCharge = 2;                  // charging phase with charge end test
 const byte stDischarge = 3;               // discharge
 const byte stStoreCharge = 4;             // recover to store volts charging
 const byte stStoreDischarge = 5;          // recover to store volts discharging
+const byte stTest = 6;
 
 // data per cell..
 struct Cell
@@ -86,7 +87,8 @@ struct Cell
     bool charge;                          // is charging
     bool discharge;                       // is discharging
     bool paused;                          // flags whan paused - used by logging
-    float mah;                            // discharge mAH
+    float ah;                             // discharge AH
+    float wh;                             // discharge watt hours
     unsigned int waitTill;                // wait timer - seconds.
     int storeLongPause;                   // on final store pause extend to 60 sec
     int pauseVolts;                       // volts at start of pause
@@ -99,6 +101,7 @@ struct Cell
     bool doCharge;                        // charge pending
     bool doDischarge;                     // discharge pending
     bool doStoreCharge;                   // store charge pending
+    bool doTest;                          // quick discharge delta test
     void off()                            // switch to off
     {
       state = stOff;
@@ -107,6 +110,10 @@ struct Cell
       doStoreCharge = false;
       digitalWrite(dischargePin(), false);
       digitalWrite(chargePin(), false);
+    }
+    int elapsedMin()  // elapsed integer minutes
+    {
+      return elapsed/60;
     }
 };
 
@@ -137,6 +144,8 @@ String stateS(byte iS)
       return "sto";
     case stStoreDischarge: 
       return "std";
+    case stTest: 
+      return "tst";
   }
   return "xxx";
 }
@@ -295,7 +304,8 @@ void doCell(Cell *cell)
           {
             cell->state = stDischarge;
             cell->elapsed = 0;
-            cell->mah = 0;
+            cell->ah = 0;
+            cell->wh = 0;
             cell->pauseVolts = 0;
             cell->dischargeMidDeltaVolts = 0;
             cell->waitTill = ts + dischargeInterval;
@@ -327,8 +337,33 @@ void doCell(Cell *cell)
             logCell(cell, stateS(cell->state) + stringKV(cell->volts) + " to" + stringKV(cell->storeChargeFinishVolts));
           }
         }
+        else if (cell->doTest)
+        {
+          cell->doTest = false;
+          cell->waitTill = ts + 10;
+          cell->state = stTest;
+          cell->discharge = true;
+          cell->pauseVolts = cell->volts;          // is volts BEFORE discharge starts
+        }
       }
       break;
+
+    case stTest:
+      {
+        // after 10 sec discharge measure diff and report
+        if (ts < cell->waitTill)
+        {
+          cell->discharge = true;
+        }
+        else
+        {
+          int adjust = int(float(dischargeVoltAdjust) * float(cell->volts) / float(dischargeMidVolts));  
+          int delta = cell->pauseVolts - cell->volts - adjust;
+          logCell(cell, stateS(cell->state) + " d=" + String(delta));
+          cell->state = stOff;
+        }
+        break;
+      }
 
     case stCharge:
       {
@@ -345,7 +380,7 @@ void doCell(Cell *cell)
           if (cell->volts >= cell->pauseVolts - 1)
           {
             // volts has not dropped by > 1mv - assume charge done
-            logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts) + " d=" + String(cell->chargeDeltaVolts));
+            logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts) + " d=" + String(cell->chargeDeltaVolts)+ " t=" + String(cell->elapsedMin()));
             cell->state = stOff;
             cell->waitTill = ts + statePauseTime;
           }
@@ -396,11 +431,14 @@ void doCell(Cell *cell)
         {
           // discharging
           cell->pauseVolts = 0;
-          cell->mah += float(cell->volts) / cell->resistor / 3600.0;
+          float volts = float(cell->volts)/1000.0;
+          float amps = volts / cell->resistor;
+          cell->ah += amps / 3600.0;
+          cell->wh += amps * volts / 3600.0;
           if (cell->volts <= dischargeEndVolts)
           {
             // is discharged
-            logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts));
+            logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts) + " t=" + String(cell->elapsedMin()) + " ah=" + String(cell->ah,3) + " wh=" + String(cell->wh,2));
             cell->state = stOff;
             cell->waitTill = ts + statePauseTime;
           }
@@ -467,7 +505,7 @@ void doCell(Cell *cell)
             }
             else
             {
-              logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts));
+              logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts)+ " t=" + String(cell->elapsedMin()));
               cell->state = stOff;
               cell->waitTill = ts + statePauseTime;
             }
@@ -524,7 +562,7 @@ void doCell(Cell *cell)
             }
             else
             {
-              logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts));
+              logCell(cell, stateS(cell->state) +"-end: " + stringKV(cell->volts)+ " t=" + String(cell->elapsedMin()));
               cell->state = stOff;
               cell->waitTill = ts + statePauseTime;
             }
@@ -599,6 +637,7 @@ void processSerial()
           log("ana raw");                          // a - shows analog raw values
           log("*-reset");                          // * - causes restet after 2 seconds
           log("build");                            // b switches build volts between 3500 and 3800
+          log("test");                             // fast discharge delta test 
           log("rv=" + String(storeVolts));
           done = true;
           break;
@@ -707,6 +746,18 @@ void processSerial()
           }
           break;
 
+        case 't':
+          if (cell->state == stOff)
+          {
+            cell->waitTill = ts;
+            cell->doTest = true;
+          }
+          else
+          {
+            logCell(cell, stateNotOff);
+          }
+          break;
+
         case 'x':
           cell->off();
           logCell(cell, "off");
@@ -796,10 +847,11 @@ void loop()
         }
         
         logCell2(cell, String(ts / 60)
-                 + c + String(cell->elapsed / 60) 
+                 + c + String(cell->elapsedMin()) 
                  + c + state
                  + c + stringK(showVolts)
-                 + c + stringK(cell->mah)
+                 + c + String(cell->ah,3)
+                 + c + String(cell->wh,2)
                  + c + String(cell->chargeDeltaVolts)
                  + c + String(cell->dischargeDeltaVolts)
                  + c + String(cell->dischargeMidDeltaVolts)
